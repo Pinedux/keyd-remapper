@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Keyd Remapper",
+  "version": "1.0.0",
+  "identifier": "com.keydremapper.app",
+  "build": {
+    "frontendDist": "../../frontend",
+    "devUrl": "http://127.0.0.1:8474"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Keyd Remapper",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null,
+      "capabilities": ["default"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "rpm", "appimage"],
+    "license": "GPL-3.0",
+    "linux": {
+      "deb": {
+        "depends": ["keyd", "python3"]
+      }
+    }
+  }
+}

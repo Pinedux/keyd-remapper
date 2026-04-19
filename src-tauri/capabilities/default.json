@@ -1,0 +1,8 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for Keyd Remapper",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}
