@@ -8,11 +8,26 @@
 
 ## Features / Características
 
-- Detect connected keyboards automatically / Detecta teclados conectados automáticamente
-- Search and download keyboard firmware / Busca y descarga firmware de teclados
-- Remap keys using [keyd](https://github.com/rvaiya/keyd) on Linux / Remapea teclas usando keyd en Linux
-- Clean web-based UI served by a local FastAPI backend / Interfaz web limpia servida por un backend FastAPI local
-- Cross-platform Tauri v2 desktop shell / Shell de escritorio multiplataforma con Tauri v2
+- **Smart device detection** — Distinguishes real keyboards from mice, power buttons, speakers, virtual devices, etc. / Detección inteligente que distingue teclados reales de ratones, botones de power, altavoces, dispositivos virtuales, etc.
+- **Per-device configuration** — Create separate keyd `.conf` files for each keyboard / Configuración independiente por dispositivo con archivos `.conf` separados.
+- **Firmware search** — Searches QMK Configurator, VIAL, GitHub, and generic firmware databases / Búsqueda en QMK Configurator, VIAL, GitHub y bases de datos genéricas.
+- **Live monitor** — Real-time keyd event stream with auto-reconnect / Monitor de eventos keyd en tiempo real con reconexión automática.
+- **keyd management** — Install, activate, and reload keyd directly from the UI / Gestión completa de keyd desde la interfaz.
+- Clean web-based UI served by a local FastAPI backend / Interfaz web limpia servida por un backend FastAPI local.
+
+---
+
+## Download / Descarga
+
+The easiest way to use Keyd Remapper is downloading the latest **AppImage** (portable, no installation required):
+
+```bash
+wget https://github.com/Pinedux/keyd-remapper/releases/download/v1.0.1/keyd-remapper-x86_64.AppImage
+chmod +x keyd-remapper-x86_64.AppImage
+./keyd-remapper-x86_64.AppImage
+```
+
+> The AppImage includes Python + backend + frontend bundled with PyInstaller, so it works on any modern x86_64 Linux distro without requiring Python or dependencies installed.
 
 ---
 
@@ -39,7 +54,7 @@ cd keyd-remapper
 npm install
 
 # Run the Tauri development build
-cargo tauri dev
+npx tauri dev
 ```
 
 Alternatively, you can run the Python backend directly without the desktop shell:
@@ -81,7 +96,7 @@ npm install
 npx tauri build
 ```
 
-Built packages (`.deb`, `.rpm`, `.AppImage`) will be available in `src-tauri/target/release/bundle/`.
+Built packages (`.deb`, `.rpm`) will be available in `src-tauri/target/release/bundle/`.
 
 ### pywebview (lightweight alternative)
 
@@ -89,6 +104,25 @@ Built packages (`.deb`, `.rpm`, `.AppImage`) will be available in `src-tauri/tar
 source .venv/bin/activate
 pip install pywebview
 python3 launch.py
+```
+
+### AppImage (standalone)
+
+```bash
+source .venv/bin/activate
+pip install pyinstaller
+python -m PyInstaller \
+  --name keyd-remapper \
+  --onefile \
+  --add-data "backend:backend" \
+  --add-data "frontend:frontend" \
+  pyinstaller_entry.py
+
+# Then package with appimagetool
+mkdir -p AppDir/usr/bin
+cp dist/keyd-remapper AppDir/usr/bin/
+# ... create .desktop and AppRun ...
+appimagetool AppDir/ keyd-remapper-x86_64.AppImage
 ```
 
 ---
