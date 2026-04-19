@@ -132,8 +132,9 @@ async fn main() {
             }
             tauri::RunEvent::ExitRequested { .. } => {
                 let child = child_for_exit.clone();
+                let handle = rt_handle.clone();
                 std::thread::spawn(move || {
-                    rt_handle.block_on(async move {
+                    handle.block_on(async move {
                         let mut lock = child.lock().await;
                         if let Some(mut c) = lock.take() {
                             let _ = c.start_kill();

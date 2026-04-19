@@ -52,17 +52,44 @@ KEYD_PORT=8474 python backend/main.py
 
 ---
 
+## Quick Start (without building Tauri) / Inicio rápido (sin compilar Tauri)
+
+If you just want to run the app quickly using Python and a native webview:
+
+```bash
+# Ensure the virtual environment is set up and dependencies are installed
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r backend/requirements.txt
+pip install pywebview
+
+# Launch the desktop window
+python3 launch.py
+```
+
+---
+
 ## Build / Compilación
+
+### Tauri v2 (full desktop shell)
 
 ```bash
 # Install dependencies
 npm install
 
 # Build the Tauri application for production
-cargo tauri build
+npx tauri build
 ```
 
 Built packages (`.deb`, `.rpm`, `.AppImage`) will be available in `src-tauri/target/release/bundle/`.
+
+### pywebview (lightweight alternative)
+
+```bash
+source .venv/bin/activate
+pip install pywebview
+python3 launch.py
+```
 
 ---
 
