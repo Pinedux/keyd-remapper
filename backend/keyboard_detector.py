@@ -12,7 +12,20 @@ router = APIRouter(prefix="/api/keyboards", tags=["keyboards"])
 
 # Path constants
 INPUT_DEVICES_PATH = Path("/proc/bus/input/devices")
-KEYD_CONFIG_PATH = Path("/etc/keyd/default.conf")
+KEYD_CONFIG_DIR = Path("/etc/keyd")
+
+# EV bitmask constants
+EV_KEY = 0x1
+EV_REL = 0x2
+
+EXCLUDED_NAME_KEYWORDS = [
+    "mouse", "speaker", "button", "virtual", "qemu", "vbox",
+    "headset", "camera", "video", "touchpad", "trackpoint", "webcam",
+    "consumer control", "system control", "power", "sleep", "lid",
+    "fan", "thermal",
+]
+
+KEYWORD_HEURISTICS = ["keyboard", "kbd", "keypad", "corne", "planck", "ergodox"]
 
 
 class KeyboardInfo(BaseModel):
@@ -23,6 +36,15 @@ class KeyboardInfo(BaseModel):
     bus: str
     device_path: str | None
     is_keyd_managed: bool
+    device_type: str
+
+
+def _parse_ev_mask(ev_str: str) -> int:
+    """Parse the EV bitmask string into an integer."""
+    try:
+        return int(ev_str, 16)
+    except ValueError:
+        return 0
 
 
 def _parse_input_devices() -> List[dict]:
@@ -67,44 +89,96 @@ def _parse_input_devices() -> List[dict]:
     return devices
 
 
-def _is_keyboard_device(dev: dict) -> bool:
-    """Determine if a device entry represents a keyboard."""
-    ev = dev.get("ev", "").lower()
-    if "120013" in ev:
-        return True
+def _is_excluded_name(name: str) -> bool:
+    """Check if device name contains excluded keywords."""
+    lower = name.lower()
+    return any(kw in lower for kw in EXCLUDED_NAME_KEYWORDS)
+
+
+def _classify_device(dev: dict) -> str:
+    """
+    Classify a device as 'keyboard', 'mouse', or 'other'.
+
+    Rules:
+      - Must have an event handler.
+      - Exclude generic power buttons (0000:0000, 0000:0001).
+      - Exclude devices with excluded keywords in name.
+      - Parse EV mask. Must have EV_KEY (0x1) to be a keyboard.
+      - If EV_REL (0x2) is present and name doesn't clearly contain 'keyboard',
+        classify as 'mouse' / exclude from keyboard.
+      - Keyword heuristic is a last resort only when EV mask confirms KEY support.
+    """
     handlers = dev.get("handlers", "")
+    name = dev.get("name", "")
+    vid = dev.get("vendor_id", "").lower()
+    pid = dev.get("product_id", "").lower()
+    ev_str = dev.get("ev", "").strip()
+
+    # Exclude devices with no event handler
+    if not any(token.startswith("event") for token in handlers.split()):
+        return "other"
+
+    # Exclude generic power buttons
+    if (vid == "0000" and pid in ("0000", "0001")) or (vid == "0000" and pid == "0000"):
+        return "other"
+
+    # Exclude by name keywords
+    if _is_excluded_name(name):
+        return "other"
+
+    ev_mask = _parse_ev_mask(ev_str)
+
+    has_key = bool(ev_mask & EV_KEY)
+    has_rel = bool(ev_mask & EV_REL)
+
+    if not has_key:
+        return "other"
+
+    # If it has REL and name doesn't clearly say keyboard, it's probably a mouse
+    if has_rel and "keyboard" not in name.lower():
+        return "mouse"
+
+    # Last resort: keyword heuristic only if KEY is supported
+    lower_name = name.lower()
+    if any(kw in lower_name for kw in KEYWORD_HEURISTICS):
+        return "keyboard"
+
+    # If EV mask strongly indicates keyboard (common keyboard mask 120013)
+    if "120013" in ev_str.lower():
+        return "keyboard"
+
+    # If it has KEY but no clear keyboard indicators, still count it
+    # if 'kbd' handler is present
     if "kbd" in handlers.split():
-        return True
-    if "event" in handlers:
-        # Heuristic: if it has a name that looks like a keyboard
-        name = dev.get("name", "").lower()
-        keyboard_keywords = ["keyboard", "kbd", "keypad", "corne", "planck", "ergodox"]
-        if any(kw in name for kw in keyboard_keywords):
-            return True
-    return False
+        return "keyboard"
+
+    # Default: if it has KEY support and an event handler, consider it keyboard
+    return "keyboard"
 
 
 def _get_keyd_ids() -> List[str]:
-    """Parse keyd default.conf and return list of ids in the [ids] section."""
-    if not KEYD_CONFIG_PATH.exists():
-        return []
-    try:
-        content = KEYD_CONFIG_PATH.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return []
-
+    """Parse all keyd .conf files and return list of ids found in [ids] sections."""
     ids = []
-    in_ids_section = False
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[ids]"):
-            in_ids_section = True
+    if not KEYD_CONFIG_DIR.exists():
+        return ids
+
+    for conf_file in sorted(KEYD_CONFIG_DIR.glob("*.conf")):
+        try:
+            content = conf_file.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
             continue
-        if stripped.startswith("[") and stripped.endswith("]"):
-            in_ids_section = False
-            continue
-        if in_ids_section and stripped and not stripped.startswith("#"):
-            ids.append(stripped.lower())
+
+        in_ids_section = False
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("[ids]"):
+                in_ids_section = True
+                continue
+            if stripped.startswith("[") and stripped.endswith("]"):
+                in_ids_section = False
+                continue
+            if in_ids_section and stripped and not stripped.startswith("#"):
+                ids.append(stripped.lower())
     return ids
 
 
@@ -168,7 +242,7 @@ def _find_event_device(handlers: str) -> str | None:
 
 
 def detect_keyboards() -> List[KeyboardInfo]:
-    """Detect connected keyboards and enrich with metadata."""
+    """Detect connected input devices and enrich with metadata."""
     raw_devices = _parse_input_devices()
     lsusb_map = _run_lsusb()
     keyd_ids = _get_keyd_ids()
@@ -177,14 +251,11 @@ def detect_keyboards() -> List[KeyboardInfo]:
     seen_ids = set()
 
     for dev in raw_devices:
-        if not _is_keyboard_device(dev):
-            continue
-
         vid = dev.get("vendor_id", "").lower()
         pid = dev.get("product_id", "").lower()
         bus_num = dev.get("bus", "")
 
-        # Skip entries with no vendor/product unless they have kbd handler
+        # Skip entries with no vendor/product
         if not vid or not pid:
             continue
 
@@ -193,7 +264,9 @@ def detect_keyboards() -> List[KeyboardInfo]:
             continue
         seen_ids.add(device_id)
 
-        name = dev.get("name", "Unknown Keyboard")
+        device_type = _classify_device(dev)
+
+        name = dev.get("name", "Unknown Device")
         # Try to enrich name
         usb_name = lsusb_map.get((vid, pid))
         if usb_name:
@@ -238,6 +311,7 @@ def detect_keyboards() -> List[KeyboardInfo]:
                 bus=bus_type,
                 device_path=device_path,
                 is_keyd_managed=is_keyd_managed,
+                device_type=device_type,
             )
         )
 

@@ -1,12 +1,17 @@
 const API_BASE = 'http://127.0.0.1:8474';
 
 const state = {
-  keyboards: [],
+  devices: [],
+  configs: [],
   keydStatus: null,
   configContent: '',
   firmwareResults: [],
   monitorConnected: false,
   monitorSocket: null,
+  monitorLines: [],
+  monitorRetryTimer: null,
+  monitorBannerShown: false,
+  monitorManualDisconnect: false,
   availableKeys: [],
   currentSection: 'dashboard',
   errors: [],
@@ -89,18 +94,19 @@ function closeSidebar() {
 
 /* ─── Router ─── */
 function router() {
-  const hash = window.location.hash.replace('#', '') || 'dashboard';
-  state.currentSection = hash;
+  const rawHash = window.location.hash.replace('#', '') || 'dashboard';
+  const [section] = rawHash.split('?');
+  state.currentSection = section;
 
   document.querySelectorAll('.nav-item').forEach(el => {
-    el.classList.toggle('active', el.dataset.section === hash);
+    el.classList.toggle('active', el.dataset.section === section);
   });
 
   document.querySelectorAll('.section').forEach(el => {
-    el.classList.toggle('active', el.id === hash);
+    el.classList.toggle('active', el.id === section);
   });
 
-  switch (hash) {
+  switch (section) {
     case 'dashboard': renderDashboard(); break;
     case 'keyboards': renderKeyboards(); break;
     case 'remap': renderRemap(); break;
@@ -110,20 +116,39 @@ function router() {
   }
 }
 
+function getHashParams() {
+  const rawHash = window.location.hash.replace('#', '');
+  const idx = rawHash.indexOf('?');
+  if (idx === -1) return {};
+  const params = new URLSearchParams(rawHash.slice(idx + 1));
+  const obj = {};
+  for (const [k, v] of params) obj[k] = v;
+  return obj;
+}
+
 /* ─── API helpers ─── */
 async function apiFetch(path, options = {}) {
   const url = `${API_BASE}${path}`;
   try {
     const res = await fetch(url, { ...options, headers: { 'Content-Type': 'application/json', ...options.headers } });
     if (!res.ok) {
+      if (res.status === 404) return null;
       let msg = `HTTP ${res.status}`;
       try { const err = await res.json(); msg = err.detail || err.message || msg; } catch (_) {}
       throw new Error(msg);
     }
     return await res.json().catch(() => ({}));
   } catch (err) {
-    showBanner(err.message, 'error');
+    if (!options._silent) showBanner(err.message, 'error');
     throw err;
+  }
+}
+
+async function apiFetchNoBanner(path, options = {}) {
+  try {
+    return await apiFetch(path, { ...options, _silent: true });
+  } catch {
+    return null;
   }
 }
 
@@ -164,6 +189,8 @@ function renderDashboard() {
   const installed = status?.installed;
   const active = status?.active;
   const version = status?.version || '—';
+  const keyboards = state.devices.filter(d => d.device_type === 'keyboard');
+  const others = state.devices.filter(d => d.device_type !== 'keyboard');
 
   el.innerHTML = `
     <div class="page-header">
@@ -199,16 +226,16 @@ function renderDashboard() {
       <div class="card">
         <div class="card-header">
           <div>
-            <div class="card-title">Keyboards</div>
-            <div class="card-subtitle">Detected devices</div>
+            <div class="card-title">Devices</div>
+            <div class="card-subtitle">Detected input devices</div>
           </div>
           <span class="status-badge status-info">
             <span class="status-dot"></span>
-            ${state.keyboards.length} found
+            ${keyboards.length} keyboards, ${others.length} other devices
           </span>
         </div>
-        <p class="text-muted text-sm mb-2">Manage device remapping and view keyboard details.</p>
-        <a class="btn btn-primary btn-sm" href="#keyboards">View Keyboards →</a>
+        <p class="text-muted text-sm mb-2">Manage device remapping and view device details.</p>
+        <a class="btn btn-primary btn-sm" href="#keyboards">View Devices →</a>
       </div>
     </div>
 
@@ -269,63 +296,97 @@ async function loadKeydStatus() {
   }
 }
 
-/* ─── Keyboards ─── */
+/* ─── Keyboards / Devices ─── */
 async function renderKeyboards() {
   const el = document.getElementById('keyboards');
+  const keyboards = state.devices.filter(d => d.device_type === 'keyboard');
+  const others = state.devices.filter(d => d.device_type !== 'keyboard');
+
+  const renderList = (list) => list.map(d => deviceCard(d)).join('');
+
   el.innerHTML = `
     <div class="page-header flex items-center justify-between">
       <div>
-        <h1>Keyboards</h1>
+        <h1>Devices</h1>
         <p>Detected input devices on your system.</p>
       </div>
       <button class="btn btn-secondary btn-sm" id="kbRefresh">↻ Refresh</button>
     </div>
     <div class="grid" id="kbGrid">
-      ${state.keyboards.length === 0
-        ? '<div class="empty-state"><div class="empty-state-icon">🖮</div><p>No keyboards detected yet.</p></div>'
-        : state.keyboards.map(kb => keyboardCard(kb)).join('')}
+      ${state.devices.length === 0
+        ? '<div class="empty-state"><div class="empty-state-icon">🖮</div><p>No devices detected yet.</p></div>'
+        : renderList(keyboards) + renderList(others)}
     </div>
   `;
 
   el.querySelector('#kbRefresh')?.addEventListener('click', async () => {
-    await loadKeyboards();
+    await loadDevices();
     renderKeyboards();
   });
 
-  if (state.keyboards.length === 0) {
-    await loadKeyboards();
+  el.querySelectorAll('.device-configure-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      location.hash = `#remap?device=${encodeURIComponent(btn.dataset.deviceId)}`;
+    });
+  });
+
+  if (state.devices.length === 0) {
+    await loadDevices();
     renderKeyboards();
   }
 }
 
-function keyboardCard(kb) {
-  const managed = kb.is_keyd_managed;
+function deviceCard(dev) {
+  const type = dev.device_type || 'other';
+  const isKeyboard = type === 'keyboard';
+  const badgeClass = type === 'keyboard' ? 'keyboard' : type === 'mouse' ? 'mouse' : 'other';
+  const badgeText = type === 'keyboard' ? 'Keyboard' : type === 'mouse' ? 'Mouse' : 'Other device';
+  const managed = dev.is_keyd_managed;
+  const deviceId = escapeHtml(dev.device_id || dev.id || '');
+
   return `
-    <div class="card keyboard-card ${managed ? '' : 'card-hover'}">
+    <div class="card device-card ${type} ${managed ? '' : 'card-hover'}">
       ${managed ? '<div class="managed-badge">Managed</div>' : ''}
-      <div class="card-title">${escapeHtml(kb.name || 'Unknown Device')}</div>
-      <div class="card-subtitle">${escapeHtml(kb.device_path || '')}</div>
+      <div class="device-type-badge ${badgeClass}">${badgeText}</div>
+      <div class="card-title">${escapeHtml(dev.name || 'Unknown Device')}</div>
+      <div class="card-subtitle">${escapeHtml(dev.device_path || '')}</div>
       <div class="keyboard-meta">
         <div class="keyboard-meta-label">Vendor ID</div>
-        <div class="keyboard-meta-item">${escapeHtml(kb.vendor_id || '—')}</div>
+        <div class="keyboard-meta-item">${escapeHtml(dev.vendor_id || '—')}</div>
         <div class="keyboard-meta-label">Product ID</div>
-        <div class="keyboard-meta-item">${escapeHtml(kb.product_id || '—')}</div>
+        <div class="keyboard-meta-item">${escapeHtml(dev.product_id || '—')}</div>
       </div>
+      ${isKeyboard ? `<button class="btn btn-primary btn-sm mt-2 device-configure-btn" data-device-id="${deviceId}">Configure</button>` : ''}
     </div>
   `;
 }
 
-async function loadKeyboards() {
+async function loadDevices() {
   try {
-    state.keyboards = await apiFetch('/api/keyboards');
+    state.devices = await apiFetch('/api/keyboards') || [];
   } catch {
-    state.keyboards = [];
+    state.devices = [];
   }
 }
 
 /* ─── Remap ─── */
 async function renderRemap() {
   const el = document.getElementById('remap');
+  const params = getHashParams();
+  const preselectedDevice = params.device;
+
+  // Ensure data is loaded
+  if (state.configs.length === 0) await loadConfigs();
+  if (state.devices.length === 0) await loadDevices();
+
+  const keyboards = state.devices.filter(d => d.device_type === 'keyboard');
+
+  const selectorOptions = [
+    `<option value="default">Default (all devices)</option>`,
+    ...keyboards.map(kb => `<option value="device:${escapeHtml(kb.device_id || kb.id || '')}">New config for ${escapeHtml(kb.name || 'Unknown Device')}</option>`),
+    ...state.configs.map(cfg => `<option value="config:${escapeHtml(cfg)}">${escapeHtml(cfg)}</option>`)
+  ].join('');
+
   el.innerHTML = `
     <div class="page-header">
       <h1>Remap</h1>
@@ -333,6 +394,10 @@ async function renderRemap() {
     </div>
 
     <div class="card mb-2">
+      <div class="card-title mb-1">Configuration</div>
+      <select id="configSelector" class="config-selector">
+        ${selectorOptions}
+      </select>
       <div class="card-title mb-1">Quick Mapping</div>
       <div class="form-row">
         <div class="form-group">
@@ -361,28 +426,98 @@ async function renderRemap() {
   `;
 
   const textarea = el.querySelector('#configText');
-  textarea.value = state.configContent;
+  const selector = el.querySelector('#configSelector');
+  const msgEl = el.querySelector('#configMsg');
 
-  el.querySelector('#loadConfig').addEventListener('click', async () => {
+  // Handle preselected device from URL
+  if (preselectedDevice) {
+    const deviceOption = Array.from(selector.options).find(opt => opt.value === `device:${preselectedDevice}`);
+    if (deviceOption) {
+      selector.value = deviceOption.value;
+      textarea.value = `[ids]\n${preselectedDevice}\n\n[main]\n`;
+    }
+  }
+
+  selector.addEventListener('change', async () => {
+    msgEl.innerHTML = '';
+    const val = selector.value;
+    if (val.startsWith('device:')) {
+      const id = val.slice(7);
+      textarea.value = `[ids]\n${id}\n\n[main]\n`;
+      return;
+    }
+    if (val === 'default') {
+      try {
+        const data = await apiFetch('/api/keyd/config');
+        textarea.value = data?.content || data?.config || '';
+      } catch { /* banner shown */ }
+      return;
+    }
+    if (val.startsWith('config:')) {
+      const name = val.slice(7);
+      try {
+        const data = await apiFetch(`/api/keyd/config/${encodeURIComponent(name)}`);
+        textarea.value = data?.content || data?.config || '';
+      } catch { /* banner shown */ }
+      return;
+    }
+  });
+
+  // Trigger load for default if nothing preselected
+  if (!preselectedDevice) {
     try {
       const data = await apiFetch('/api/keyd/config');
-      state.configContent = data.content || data.config || '';
-      textarea.value = state.configContent;
+      textarea.value = data?.content || data?.config || '';
+    } catch { /* banner shown */ }
+  }
+
+  el.querySelector('#loadConfig').addEventListener('click', async () => {
+    const val = selector.value;
+    msgEl.innerHTML = '';
+    try {
+      let data;
+      if (val.startsWith('config:')) {
+        const name = val.slice(7);
+        data = await apiFetch(`/api/keyd/config/${encodeURIComponent(name)}`);
+      } else if (val.startsWith('device:')) {
+        showBanner('Create a new device-specific config', 'success');
+        return;
+      } else {
+        data = await apiFetch('/api/keyd/config');
+      }
+      textarea.value = data?.content || data?.config || '';
       showBanner('Configuration loaded', 'success');
     } catch { /* banner shown */ }
   });
 
   el.querySelector('#saveConfig').addEventListener('click', async () => {
     const content = textarea.value;
-    const msgEl = el.querySelector('#configMsg');
+    const val = selector.value;
+    msgEl.innerHTML = '';
     try {
-      await apiFetch('/api/keyd/config', {
-        method: 'POST',
-        body: JSON.stringify({ content })
-      });
-      await apiFetch('/api/keyd/reload', { method: 'POST' });
+      if (val.startsWith('device:')) {
+        const deviceId = val.slice(7);
+        await apiFetch('/api/keyd/apply-device', {
+          method: 'POST',
+          body: JSON.stringify({ device_id: deviceId, content })
+        });
+      } else if (val.startsWith('config:')) {
+        const name = val.slice(7);
+        await apiFetch(`/api/keyd/config/${encodeURIComponent(name)}`, {
+          method: 'POST',
+          body: JSON.stringify({ content })
+        });
+      } else {
+        await apiFetch('/api/keyd/config', {
+          method: 'POST',
+          body: JSON.stringify({ content })
+        });
+      }
+      if (!val.startsWith('device:')) {
+        await apiFetch('/api/keyd/reload', { method: 'POST' });
+      }
       msgEl.innerHTML = '<span style="color:var(--success)">✓ Saved and applied.</span>';
-      showBanner('Config saved and reloaded', 'success');
+      showBanner('Config saved and applied', 'success');
     } catch (err) {
       msgEl.innerHTML = `<span style="color:var(--error)">✗ ${escapeHtml(err.message)}</span>`;
     }
@@ -409,6 +544,15 @@ async function renderRemap() {
   const opts = state.availableKeys.map(k => `<option value="${escapeHtml(k)}">${escapeHtml(k)}</option>`).join('');
   el.querySelector('#fromKey').innerHTML = '<option value="">Select key…</option>' + opts;
   el.querySelector('#toKey').innerHTML = '<option value="">Select key…</option>' + opts;
+}
+
+async function loadConfigs() {
+  try {
+    const data = await apiFetch('/api/keyd/configs');
+    state.configs = Array.isArray(data) ? data : (data.configs || []);
+  } catch {
+    state.configs = [];
+  }
 }
 
 /* ─── Firmware ─── */
@@ -477,9 +621,12 @@ function renderMonitor() {
         <h1>Monitor</h1>
         <p>Live keyd event stream.</p>
       </div>
-      <button class="btn ${state.monitorConnected ? 'btn-danger' : 'btn-primary'}" id="monToggle">
-        ${state.monitorConnected ? 'Disconnect' : 'Connect'}
-      </button>
+      <div class="flex items-center gap-2">
+        ${state.monitorRetryTimer ? '<div class="retry-indicator" id="monRetry"><span class="spinner"></span> Reconnecting…</div>' : ''}
+        <button class="btn ${state.monitorConnected ? 'btn-danger' : 'btn-primary'}" id="monToggle">
+          ${state.monitorConnected ? 'Disconnect' : 'Connect'}
+        </button>
+      </div>
     </div>
     <div class="terminal" id="monTerminal">
       <div class="terminal-line system">Ready. Press Connect to start monitoring events.</div>
@@ -490,40 +637,60 @@ function renderMonitor() {
 
   // restore existing lines if reconnecting render
   const term = el.querySelector('#monTerminal');
-  if (state.monitorLines && state.monitorLines.length) {
+  if (state.monitorLines.length) {
     term.innerHTML = state.monitorLines.join('');
     term.scrollTop = term.scrollHeight;
   }
 }
 
-let stateMonitorLines = [];
-
 function toggleMonitor() {
   if (state.monitorConnected) {
+    state.monitorManualDisconnect = true;
     disconnectMonitor();
   } else {
+    state.monitorManualDisconnect = false;
     connectMonitor();
   }
 }
 
 function connectMonitor() {
   if (state.monitorSocket) return;
+  state.monitorManualDisconnect = false;
   const ws = new WebSocket('ws://127.0.0.1:8474/ws/keyd-monitor');
   state.monitorSocket = ws;
 
   ws.onopen = () => {
     state.monitorConnected = true;
+    state.monitorBannerShown = false;
+    clearRetryTimer();
     appendMonitorLine('Connected to keyd monitor.', 'system');
-    renderMonitor(); // update button
+    renderMonitor();
   };
 
   ws.onmessage = (ev) => {
-    let data = ev.data;
-    let type = 'system';
-    const lower = data.toLowerCase();
-    if (lower.includes('down') || lower.includes('press')) type = 'keydown';
-    else if (lower.includes('up') || lower.includes('release')) type = 'keyup';
-    appendMonitorLine(data, type);
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'ping') {
+        return;
+      }
+      if (msg.type === 'event') {
+        const text = msg.data || '';
+        let type = 'system';
+        const lower = text.toLowerCase();
+        if (lower.includes('down') || lower.includes('press')) type = 'keydown';
+        else if (lower.includes('up') || lower.includes('release')) type = 'keyup';
+        appendMonitorLine(text, type);
+        return;
+      }
+      appendMonitorLine(JSON.stringify(msg), 'system');
+    } catch {
+      const data = ev.data;
+      let type = 'system';
+      const lower = data.toLowerCase();
+      if (lower.includes('down') || lower.includes('press')) type = 'keydown';
+      else if (lower.includes('up') || lower.includes('release')) type = 'keyup';
+      appendMonitorLine(data, type);
+    }
   };
 
   ws.onclose = () => {
@@ -531,10 +698,16 @@ function connectMonitor() {
     state.monitorSocket = null;
     appendMonitorLine('Disconnected.', 'system');
     renderMonitor();
+    if (!state.monitorManualDisconnect) {
+      scheduleMonitorRetry();
+    }
   };
 
   ws.onerror = () => {
-    showBanner('WebSocket error. Is the backend running?', 'error');
+    if (!state.monitorBannerShown) {
+      showBanner('WebSocket error. Is the backend running?', 'error');
+      state.monitorBannerShown = true;
+    }
     state.monitorConnected = false;
     state.monitorSocket = null;
     renderMonitor();
@@ -542,16 +715,37 @@ function connectMonitor() {
 }
 
 function disconnectMonitor() {
+  clearRetryTimer();
+  state.monitorManualDisconnect = true;
   if (state.monitorSocket) {
     state.monitorSocket.close();
+  }
+}
+
+function scheduleMonitorRetry() {
+  if (state.monitorRetryTimer) return;
+  state.monitorRetryTimer = setTimeout(() => {
+    state.monitorRetryTimer = null;
+    if (!state.monitorConnected) {
+      connectMonitor();
+    }
+  }, 3000);
+  renderMonitor();
+}
+
+function clearRetryTimer() {
+  if (state.monitorRetryTimer) {
+    clearTimeout(state.monitorRetryTimer);
+    state.monitorRetryTimer = null;
+    renderMonitor();
   }
 }
 
 function appendMonitorLine(text, type) {
   const term = document.getElementById('monTerminal');
   const line = `<div class="terminal-line ${type}">${escapeHtml(text)}</div>`;
-  stateMonitorLines.push(line);
-  if (stateMonitorLines.length > 500) stateMonitorLines.shift();
+  state.monitorLines.push(line);
+  if (state.monitorLines.length > 500) state.monitorLines.shift();
   if (term) {
     term.insertAdjacentHTML('beforeend', line);
     term.scrollTop = term.scrollHeight;

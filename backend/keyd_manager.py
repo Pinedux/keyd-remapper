@@ -13,7 +13,8 @@ from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/keyd", tags=["keyd"])
 
-KEYD_CONFIG_PATH = Path("/etc/keyd/default.conf")
+KEYD_CONFIG_DIR = Path("/etc/keyd")
+KEYD_CONFIG_PATH = KEYD_CONFIG_DIR / "default.conf"
 DEFAULT_CONFIG = """# keyd default configuration
 # Add your device ids below and define layers/remaps.
 
@@ -59,6 +60,17 @@ class KeyListResult(BaseModel):
     keys: List[str]
 
 
+class ConfigInfo(BaseModel):
+    name: str
+    device_id: str | None
+    content_preview: str
+
+
+class DeviceConfigPayload(BaseModel):
+    device_id: str
+    content: str
+
+
 def _which(cmd: str) -> str | None:
     return shutil.which(cmd)
 
@@ -87,6 +99,28 @@ def _detect_distro() -> str | None:
         return None
     except Exception:
         return None
+
+
+def _sanitize_device_id(device_id: str) -> str:
+    """Sanitize a device id (vid:pid) into a safe filename."""
+    return re.sub(r"[^0-9a-fA-F]", "_", device_id)
+
+
+def _extract_first_device_id(content: str) -> str | None:
+    """Extract the first non-wildcard device id from an [ids] section."""
+    in_ids = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[ids]"):
+            in_ids = True
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_ids = False
+            continue
+        if in_ids and stripped and not stripped.startswith("#"):
+            if stripped != "*":
+                return stripped
+    return None
 
 
 @router.get("/status", response_model=KeydStatus)
@@ -119,7 +153,7 @@ def get_status() -> KeydStatus:
         installed=installed,
         active=active,
         version=version,
-        config_path=str(KEYD_CONFIG_PATH),
+        config_path=str(KEYD_CONFIG_DIR),
     )
 
 
@@ -178,9 +212,11 @@ def activate_keyd() -> KeydStatus:
     return get_status()
 
 
+# Backward-compatible endpoints
+
 @router.get("/config", response_model=ConfigResult)
 def get_config() -> ConfigResult:
-    """Read the current keyd configuration file."""
+    """Read the current keyd default configuration file."""
     if KEYD_CONFIG_PATH.exists():
         try:
             content = KEYD_CONFIG_PATH.read_text(encoding="utf-8", errors="ignore")
@@ -193,20 +229,115 @@ def get_config() -> ConfigResult:
 @router.post("/config", response_model=WriteConfigResult)
 def write_config(payload: ConfigPayload) -> WriteConfigResult:
     """Write configuration to /etc/keyd/default.conf using pkexec tee."""
+    return _write_config_file("default", payload.content)
+
+
+# Multi-device configuration endpoints
+
+@router.get("/configs", response_model=List[ConfigInfo])
+def list_configs() -> List[ConfigInfo]:
+    """List all keyd configuration files."""
+    configs = []
+    if not KEYD_CONFIG_DIR.exists():
+        return configs
+
+    for conf_file in sorted(KEYD_CONFIG_DIR.glob("*.conf")):
+        name = conf_file.stem
+        try:
+            content = conf_file.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            content = ""
+        preview = content[:200]
+        device_id = _extract_first_device_id(content)
+        configs.append(
+            ConfigInfo(
+                name=name,
+                device_id=device_id,
+                content_preview=preview,
+            )
+        )
+    return configs
+
+
+@router.get("/config/{name}", response_model=ConfigResult)
+def get_named_config(name: str) -> ConfigResult:
+    """Read a specific keyd configuration file."""
+    conf_path = KEYD_CONFIG_DIR / f"{name}.conf"
+    if conf_path.exists():
+        try:
+            content = conf_path.read_text(encoding="utf-8", errors="ignore")
+            return ConfigResult(content=content, exists=True)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return ConfigResult(content="", exists=False)
+
+
+@router.post("/config/{name}", response_model=WriteConfigResult)
+def write_named_config(name: str, payload: ConfigPayload) -> WriteConfigResult:
+    """Write configuration to a specific keyd configuration file."""
+    return _write_config_file(name, payload.content)
+
+
+@router.delete("/config/{name}", response_model=WriteConfigResult)
+def delete_named_config(name: str) -> WriteConfigResult:
+    """Delete a specific keyd configuration file."""
     if platform.system() != "Linux":
         raise HTTPException(status_code=400, detail="Only supported on Linux.")
 
+    if name == "default":
+        raise HTTPException(status_code=400, detail="Cannot delete the default configuration.")
+
+    conf_path = KEYD_CONFIG_DIR / f"{name}.conf"
+    if not conf_path.exists():
+        return WriteConfigResult(success=True)
+
+    try:
+        proc = _run(["pkexec", "rm", str(conf_path)], timeout=15)
+        if proc.returncode == 0:
+            return WriteConfigResult(success=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete config: {proc.stderr or proc.stdout}",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/apply-device", response_model=WriteConfigResult)
+def apply_device_config(payload: DeviceConfigPayload) -> WriteConfigResult:
+    """Create or overwrite a config file named after the sanitized device_id."""
+    if platform.system() != "Linux":
+        raise HTTPException(status_code=400, detail="Only supported on Linux.")
+
+    sanitized = _sanitize_device_id(payload.device_id)
+    if not sanitized:
+        raise HTTPException(status_code=400, detail="Invalid device_id.")
+
+    content = payload.content
+    # Prepend [ids] section if not already present
+    if "[ids]" not in content:
+        content = f"[ids]\n{payload.device_id}\n\n" + content
+
+    return _write_config_file(sanitized, content)
+
+
+def _write_config_file(name: str, content: str) -> WriteConfigResult:
+    """Internal helper to write a config file using pkexec tee."""
+    if platform.system() != "Linux":
+        raise HTTPException(status_code=400, detail="Only supported on Linux.")
+
+    conf_path = KEYD_CONFIG_DIR / f"{name}.conf"
     try:
         # Ensure directory exists
-        proc = _run(["pkexec", "mkdir", "-p", str(KEYD_CONFIG_PATH.parent)], timeout=15)
+        proc = _run(["pkexec", "mkdir", "-p", str(KEYD_CONFIG_DIR)], timeout=15)
         if proc.returncode != 0 and "File exists" not in (proc.stderr or ""):
-            return WriteConfigResult(
-                success=False,
-            )
+            return WriteConfigResult(success=False)
 
         proc = subprocess.run(
-            ["pkexec", "tee", str(KEYD_CONFIG_PATH)],
-            input=payload.content,
+            ["pkexec", "tee", str(conf_path)],
+            input=content,
             capture_output=True,
             text=True,
             timeout=15,

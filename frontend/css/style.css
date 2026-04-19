@@ -481,12 +481,14 @@ textarea {
   color: #86efac;
 }
 
-/* Keyboard cards */
+/* Device cards */
+.device-card,
 .keyboard-card {
   position: relative;
   overflow: hidden;
 }
 
+.device-card .managed-badge,
 .keyboard-card .managed-badge {
   position: absolute;
   top: 0;
@@ -498,6 +500,37 @@ textarea {
   font-weight: 700;
   text-transform: uppercase;
   border-bottom-left-radius: var(--radius);
+}
+
+.device-type-badge {
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 4px 10px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  border-bottom-right-radius: var(--radius);
+}
+
+.device-type-badge.keyboard {
+  background: var(--accent);
+  color: #fff;
+}
+
+.device-type-badge.mouse {
+  background: #f97316;
+  color: #fff;
+}
+
+.device-type-badge.other {
+  background: #6b7280;
+  color: #fff;
+}
+
+.device-card.mouse,
+.device-card.other {
+  opacity: 0.7;
 }
 
 .keyboard-meta {
@@ -705,3 +738,20 @@ textarea {
 .w-full { width: 100%; }
 .text-muted { color: var(--text-muted); }
 .text-sm { font-size: 0.85rem; }
+
+/* Config selector */
+.config-selector {
+  margin-bottom: 16px;
+}
+
+/* Retry indicator */
+.retry-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+/* Utility */
+.mt-2 { margin-top: 16px; }

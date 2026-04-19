@@ -12,6 +12,7 @@ router = APIRouter(tags=["websocket"])
 
 DEMO_INTERVAL_SECONDS = 2
 DEMO_MESSAGE = "keyd monitor requires root privileges. Run app with pkexec or ensure keyd access."
+PING_INTERVAL_SECONDS = 5
 
 
 async def _stream_keyd_monitor(websocket: WebSocket) -> None:
@@ -27,9 +28,12 @@ async def _stream_keyd_monitor(websocket: WebSocket) -> None:
 
     if cmd is None:
         # Demo / fallback mode
-        while True:
-            await websocket.send_json({"type": "event", "data": DEMO_MESSAGE})
-            await asyncio.sleep(DEMO_INTERVAL_SECONDS)
+        try:
+            while True:
+                await websocket.send_json({"type": "event", "data": DEMO_MESSAGE})
+                await asyncio.sleep(DEMO_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            return
         return
 
     proc: Optional[asyncio.subprocess.Process] = None
@@ -42,19 +46,25 @@ async def _stream_keyd_monitor(websocket: WebSocket) -> None:
         if proc.stdout is None:
             raise RuntimeError("Failed to open stdout pipe")
 
-        while True:
-            line_bytes = await proc.stdout.readline()
-            if not line_bytes:
-                break
-            line = line_bytes.decode("utf-8", errors="ignore").rstrip("\n")
-            await websocket.send_json({"type": "event", "data": line})
+        try:
+            while True:
+                line_bytes = await proc.stdout.readline()
+                if not line_bytes:
+                    break
+                line = line_bytes.decode("utf-8", errors="ignore").rstrip("\n")
+                await websocket.send_json({"type": "event", "data": line})
+        except asyncio.CancelledError:
+            return
     except asyncio.CancelledError:
-        raise
+        return
     except Exception:
         # Fallback to demo mode on any error
-        while True:
-            await websocket.send_json({"type": "event", "data": DEMO_MESSAGE})
-            await asyncio.sleep(DEMO_INTERVAL_SECONDS)
+        try:
+            while True:
+                await websocket.send_json({"type": "event", "data": DEMO_MESSAGE})
+                await asyncio.sleep(DEMO_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            return
     finally:
         if proc is not None and proc.returncode is None:
             try:
@@ -64,26 +74,43 @@ async def _stream_keyd_monitor(websocket: WebSocket) -> None:
                 pass
 
 
+async def _ping_task(websocket: WebSocket) -> None:
+    """Send periodic server-side ping JSON messages to keep connection alive."""
+    try:
+        while True:
+            await asyncio.sleep(PING_INTERVAL_SECONDS)
+            await websocket.send_json({"type": "ping"})
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
+
+
 @router.websocket("/ws/keyd-monitor")
 async def keyd_monitor_ws(websocket: WebSocket) -> None:
     await websocket.accept()
-    task: Optional[asyncio.Task] = None
+    stream_task: Optional[asyncio.Task] = None
+    ping_task: Optional[asyncio.Task] = None
     try:
-        task = asyncio.create_task(_stream_keyd_monitor(websocket))
-        # Keep the connection alive until client disconnects
+        stream_task = asyncio.create_task(_stream_keyd_monitor(websocket))
+        ping_task = asyncio.create_task(_ping_task(websocket))
+        # Wait for the client to disconnect
         while True:
-            # Expecting periodic pings or empty messages from client
-            data = await websocket.receive_text()
-            if data == "ping":
-                await websocket.send_text("pong")
+            await websocket.receive_text()
     except WebSocketDisconnect:
         pass
     except Exception:
         pass
     finally:
-        if task is not None:
-            task.cancel()
+        if stream_task is not None:
+            stream_task.cancel()
             try:
-                await task
+                await stream_task
+            except asyncio.CancelledError:
+                pass
+        if ping_task is not None:
+            ping_task.cancel()
+            try:
+                await ping_task
             except asyncio.CancelledError:
                 pass
